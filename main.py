@@ -9,13 +9,65 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, mean_squared_error
 import functools
 print = functools.partial(print, flush=True)
+import polars as pl
+
 def load_dataframe(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".csv":
-        return pd.read_csv(path)
+
     if ext in (".parquet", ".pq"):
-        return pd.read_parquet(path)
-    raise ValueError(f"Unsupported file type '{ext}'. Use .csv or .parquet")
+        # Read all columns (or select below)
+        df = pl.read_parquet(path)  # multi-threaded
+    elif ext == ".csv":
+        df = pl.read_csv(path)      # multi-threaded
+    else:
+        raise ValueError("Unsupported file type")
+
+
+    return df.to_pandas()
+
+def preprocess_for_xgb(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+
+    # 1) Datetime columns -> epoch seconds (float32), without Series.view
+    dt_cols = X.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns
+    for c in dt_cols:
+        s = pd.to_datetime(X[c], errors="coerce")
+        # datetime -> int64 nanoseconds -> seconds
+        X[c] = (s.astype("int64") // 10**9).astype("float32")
+
+    # 2) Object columns -> category (keep as category for enable_categorical)
+    obj_cols = X.select_dtypes(include=["object"]).columns
+    for c in obj_cols:
+        X[c] = X[c].astype("category")
+
+    # 3) Clean categorical columns that can break XGBoost:
+    #    - all missing in this split
+    #    - zero categories
+    cat_cols = X.select_dtypes(include=["category"]).columns
+    drop_cols = []
+    for c in cat_cols:
+        # If all values are NA -> XGBoost categorical path can explode
+        if X[c].isna().all():
+            drop_cols.append(c)
+            continue
+
+        # Ensure categories exist (rare but can happen)
+        if len(X[c].cat.categories) == 0:
+            drop_cols.append(c)
+            continue
+
+        # Remove unused categories (good hygiene)
+        X[c] = X[c].cat.remove_unused_categories()
+
+        # After removing unused, still empty?
+        if len(X[c].cat.categories) == 0:
+            drop_cols.append(c)
+
+    if drop_cols:
+        X = X.drop(columns=drop_cols)
+
+    return X
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -32,7 +84,10 @@ def main():
     if args.target not in df.columns:
         raise ValueError(f"Target column '{args.target}' not found in dataset")
 
+
+
     X = df.drop(columns=[args.target])
+    X = preprocess_for_xgb(X)
     y = df[args.target]
 
     # Train/validation split
@@ -53,16 +108,20 @@ def main():
     if task == "classification":
         model = xgb.XGBClassifier(
             tree_method="hist",
-            nthread=args.cores,
+            n_jobs=args.cores,
+            n_estimators=200,
             eval_metric="logloss",
-            verbosity=0
+            verbosity=0,
+            enable_categorical=True
         )
     else:
         model = xgb.XGBRegressor(
             tree_method="hist",
-            nthread=args.cores,
+            n_jobs=args.cores,
+            n_estimators=200,
             eval_metric="rmse",
-            verbosity=0
+            verbosity=0,
+            enable_categorical=True
         )
 
     # Time training only

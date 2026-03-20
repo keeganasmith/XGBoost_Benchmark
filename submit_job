@@ -6,12 +6,38 @@
 #SBATCH --partition=pvc 
 #SBATCH --gres=gpu:pvc:2
 
-
 module purge
-module load WebProxy 
+module load WebProxy
+
 # ADD YOUR COMMANDS BELOW
 cd $SCRATCH/XGBoost_Benchmark
 
 source modules.sh
 source venv/bin/activate
-bash run_script.sh
+export OMP_NUM_THREADS=96
+
+# Start memory logging in background
+for((i=0;i<3;i++)){
+  
+  MEM_LOG="regular_outputs/mem_usage_${i}.csv"
+  echo "timestamp,total_GB,used_GB,free_GB,available_GB" > "$MEM_LOG"
+
+  (
+    while true; do
+      ts=$(date +"%Y-%m-%d %H:%M:%S")
+      # Extract memory stats (in GB)
+      read total used free shared buff_cache available < <(free -g | awk '/^Mem:/ {print $2,$3,$4,$5,$6,$7}')
+      echo "$ts,$total,$used,$free,$available" >> "$MEM_LOG"
+      sleep 2
+    done
+  ) &
+  LOGGER_PID=$!
+
+  # Run your main script
+  bash run_script.sh > "regular_outputs/output_${i}" 2>&1
+  kill $LOGGER_PID
+  wait $LOGGER_PID 2>/dev/null
+
+}
+# Stop logger when run_script finishes
+
